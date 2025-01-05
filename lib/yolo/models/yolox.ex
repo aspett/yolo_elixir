@@ -200,10 +200,16 @@ defmodule YOLO.Models.Yolox do
     fn detected_objects ->
       # Use rust to filter for objects with a prob threshold above the threshold
       # to reduce number of objects going through evision nms
+      idxs = Yolo.PerformantFilter.idx_filter_greater(detected_objects[[.., 4]], prob_threshold)
       prob_threshold_filtered_objects =
-        detected_objects[[.., 4]]
-        |> Yolo.PerformantFilter.idx_filter_greater(prob_threshold)
-        |> then(&Nx.gather(detected_objects, &1 |> Nx.new_axis(1)))
+        case idxs do
+          [] ->
+            []
+
+          idxs ->
+            Nx.gather(detected_objects, idxs |> Nx.new_axis(1))
+        end
+
       # prob_threshold_filtered_objects = detected_objects
 
       # Evision provides a good nms implementation that's compatible, so we use it
