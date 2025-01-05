@@ -201,31 +201,38 @@ defmodule YOLO.Models.Yolox do
       # Use rust to filter for objects with a prob threshold above the threshold
       # to reduce number of objects going through evision nms
       idxs = Yolo.PerformantFilter.idx_filter_greater(detected_objects[[.., 4]], prob_threshold)
-      prob_threshold_filtered_objects =
-        case idxs do
-          [] ->
-            []
 
-          idxs ->
-            Nx.gather(detected_objects, idxs |> Nx.new_axis(1))
-        end
+      case idxs do
+        [] ->
+          []
+
+        idxs ->
+          prob_threshold_filtered_objects = Nx.gather(detected_objects, idxs |> Nx.new_axis(1))
+          idxs = Evision.DNN.nmsBoxes(
+            prob_threshold_filtered_objects[[.., 0..3]],
+            prob_threshold_filtered_objects[[.., 4]] |> Nx.to_list(),
+            prob_threshold,
+            nms_threshold
+          )
+
+          idxs = Nx.tensor(idxs)
+          {prob_threshold_filtered_objects, idxs}
+      end
 
       # prob_threshold_filtered_objects = detected_objects
 
       # Evision provides a good nms implementation that's compatible, so we use it
-      idxs = Evision.DNN.nmsBoxes(
-        prob_threshold_filtered_objects[[.., 0..3]],
-        prob_threshold_filtered_objects[[.., 4]] |> Nx.to_list(),
-        prob_threshold,
-        nms_threshold
-      )
+      # idxs = Evision.DNN.nmsBoxes(
+      #   prob_threshold_filtered_objects[[.., 0..3]],
+      #   prob_threshold_filtered_objects[[.., 4]] |> Nx.to_list(),
+      #   prob_threshold,
+      #   nms_threshold
+      # )
 
-      idxs = Nx.tensor(idxs)
-
-      Nx.take(prob_threshold_filtered_objects, idxs)
+      # idxs = Nx.tensor(idxs)
 
       # Return the filtered objects and the indices of the objects that were kept
-      {prob_threshold_filtered_objects, idxs}
+      # {prob_threshold_filtered_objects, idxs}
     end
   end
 end
