@@ -126,8 +126,8 @@ defmodule YOLO.FrameScalers do
 
     Enum.map(bboxes, fn [cx, cy, w, h, prob, class] ->
       [
-        round((cx - width_padding) / ratio),
-        round((cy - height_padding) / ratio),
+        round(cx / ratio - width_padding),
+        round(cy / ratio - height_padding),
         round(w / ratio),
         round(h / ratio),
         prob,
