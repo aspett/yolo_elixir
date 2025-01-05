@@ -33,7 +33,7 @@ defmodule YOLO.Models.Yolox do
 
   @impl true
   def postprocess(%{precalculated: precalculated}, model_output, scaling_config, opts) do
-    nms_fun = Keyword.get(opts, :nms_fun, fast_nms(0.4, 0.45))
+    nms_fun = Keyword.get(opts, :nms_fun, slow_nms(0.4, 0.45))
 
     %{grids: grids, expanded_strides: expanded_strides} = precalculated
     prediction = process_bboxes(model_output, grids, expanded_strides)
@@ -45,7 +45,11 @@ defmodule YOLO.Models.Yolox do
         bboxes = Nx.take(filtered_objects, Nx.tensor(idxs)) |> Nx.to_list()
         YOLO.FrameScalers.scale_bboxes_to_original(bboxes, scaling_config)
 
+      [[_|_]|_] = bboxes ->
+        YOLO.FrameScalers.scale_bboxes_to_original(bboxes, scaling_config)
+
       idxs ->
+        dbg(idxs)
         bboxes = Nx.take(detected_objects, Nx.tensor(idxs)) |> Nx.to_list()
         YOLO.FrameScalers.scale_bboxes_to_original(bboxes, scaling_config)
     end
@@ -64,32 +68,18 @@ defmodule YOLO.Models.Yolox do
     # Yolox calculates detection scores as the product of maximum class probabilities and objectness score
     scores = Nx.multiply(class_probs, objectness)
 
-    # Mostly the same as YOLO.NMS.filter_predictions now
-    # max_prob = Nx.reduce_max(scores, axes: [1])
-    # max_prob = Nx.argmax(scores, axis: 1) |> Nx.to_list |> Enum.sort(:desc) |> dbg()
+    # Per row, gets the max prob and the class with that prob
+    {max_prob, max_prob_class} = Nx.top_k(scores, k: 1)
 
-    # for each row (each detected object) get the class index with max prob
-    # max_prob_class = Nx.argmax(scores, axis: 1)
-    {kmax_prob, kmax_prob_class} = Nx.top_k(scores, k: 1)
-
-    # max_prob = Nx.reverse(max_prob)
-    # max_prob_class = Nx.reverse(max_prob_class)
-
-    # returning the indices of a descending ordered `max_prob` tensor
-    # sorted_idx = Nx.argsort(max_prob, direction: :desc) |> dbg()
-
-    # concatenating the columns [cx, cy, w, h, prob, class] and getting the rows in sorted desc order
-    # detected_objects =
-    # Nx.concatenate([bboxes, Nx.new_axis(max_prob, 1), Nx.new_axis(max_prob_class, 1)], axis: 1)
-    Nx.concatenate([bboxes, kmax_prob, kmax_prob_class], axis: 1)
-    # |> Nx.take(sorted_idx)
+    # concatenating the columns [cx, cy, w, h, prob, class]
+    Nx.concatenate([bboxes, max_prob, max_prob_class], axis: 1)
   end
 
   # YOLOX uses convolutions, so to decode the output, we have to
   # apply strides to map predictions to input image space.
   # Translated from https://github.com/Megvii-BaseDetection/YOLOX/blob/d872c71bf63e1906ef7b7bb5a9d7a529c7a59e6a/yolox/utils/demo_utils.py#L139
   # Generation of grids and expanded strides is split out into `generate_grids_and_expanded_strides`
-  # as it's relatively quick, whereas process_bboxes benefits from Nx compilation
+  # which is precalculated when the model is loaded, since we don't need to run it for every inference!
   defn process_bboxes(model_output, grids, expanded_strides) do
     # {1, 8400, 85} -> {8400, 85}
     model_output = Nx.squeeze(model_output, axes: [0])
@@ -164,31 +154,6 @@ defmodule YOLO.Models.Yolox do
     {grids, expanded_strides}
   end
 
-  defn broadcast_grid_strides(grids, expanded_strides, model_output) do
-    coords = model_output[[.., 0..1]]
-    sizes = model_output[[.., 2..3]]
-    remainder = model_output[[.., 4..-1//1]]
-
-    # Align shapes for broadcasting
-    # Python: grids = grids.reshape(1, -1, 2)
-    #         expanded_strides = expanded_strides.reshape(1, -1, 1)
-    # From {1, 8400, 2} to {8400, 2}
-    grids = Nx.squeeze(grids, axes: [0])
-    # From {1, 8400, 1} to {8400, 1}
-    expanded_strides = Nx.squeeze(expanded_strides, axes: [0])
-
-    # Update the coordinates and sizes using tensorized operations
-    # Python:
-    # outputs[..., :2] = (outputs[..., :2] + grids) * expanded_strides
-    # outputs[..., 2:4] = np.exp(outputs[..., 2:4]) * expanded_strides
-    updated_coords = Nx.add(coords, grids) |> Nx.multiply(expanded_strides)
-    updated_sizes = Nx.exp(sizes) |> Nx.multiply(expanded_strides)
-
-    # Concatenate updated slices with the remainder of the outputs
-    # Python: return outputs
-    Nx.concatenate([updated_coords, updated_sizes, remainder], axis: 1)
-  end
-
   # Basic implementation of numpy.meshgrid
   defn meshgrid(opts \\ []) do
     opts = keyword!(opts, x_range: 1, y_range: 1)
@@ -198,21 +163,41 @@ defmodule YOLO.Models.Yolox do
 
     # Broadcast x and y to create the grids
     # Repeat x across rows
+    # [[0, 1, 2, ...], [0, 1, 2, ...], ...]
     x_grid = Nx.broadcast(x, {opts[:y_range], opts[:x_range]})
+
     # Repeat y across columns
+    # [[0, 0, 0, ...], [1, 1, 1, ...], ...]
     y_grid = Nx.broadcast(y, {opts[:y_range], opts[:x_range]}) |> Nx.transpose()
 
     {x_grid, y_grid}
   end
 
+  def slow_nms(prob_threshold, nms_threshold) do
+    fn detected_objects ->
+      filtered_objects =
+        detected_objects
+        |> Nx.to_list()
+        |> Enum.sort_by(fn [_cx, _cy, _w, _h, prob, _class] -> prob end, :desc)
+        |> Enum.filter(fn [_cx, _cy, _w, _h, prob, _class] ->
+          prob >= prob_threshold
+        end)
+
+      YOLO.NMS.nms(filtered_objects, nms_threshold)
+    end
+  end
+
   def fast_nms(prob_threshold, nms_threshold) do
     fn detected_objects ->
+      # Use rust to filter for objects with a prob threshold above the threshold
+      # to reduce number of objects going through evision nms
       prob_threshold_filtered_objects =
         detected_objects[[.., 4]]
         |> Yolo.PerformantFilter.idx_filter_greater(prob_threshold)
         |> then(&Nx.gather(detected_objects, &1 |> Nx.new_axis(1)))
       # prob_threshold_filtered_objects = detected_objects
 
+      # Evision provides a good nms implementation that's compatible, so we use it
       idxs = Evision.DNN.nmsBoxes(
         prob_threshold_filtered_objects[[.., 0..3]],
         prob_threshold_filtered_objects[[.., 4]] |> Nx.to_list(),
@@ -223,6 +208,8 @@ defmodule YOLO.Models.Yolox do
       idxs = Nx.tensor(idxs)
 
       Nx.take(prob_threshold_filtered_objects, idxs)
+
+      # Return the filtered objects and the indices of the objects that were kept
       {prob_threshold_filtered_objects, idxs}
     end
   end
