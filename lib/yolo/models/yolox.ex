@@ -33,7 +33,10 @@ defmodule YOLO.Models.Yolox do
 
   @impl true
   def postprocess(%{precalculated: precalculated}, model_output, scaling_config, opts) do
-    nms_fun = Keyword.get(opts, :nms_fun, slow_nms(0.4, 0.45))
+    prob_threshold = Keyword.get(opts, :prob_threshold, 0.4)
+    nms_threshold = Keyword.get(opts, :nms_threshold, 0.45)
+
+    nms_fun = Keyword.get(opts, :nms_fun, slow_nms(prob_threshold, nms_threshold))
 
     %{grids: grids, expanded_strides: expanded_strides} = precalculated
     prediction = process_bboxes(model_output, grids, expanded_strides)
