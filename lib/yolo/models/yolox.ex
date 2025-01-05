@@ -9,7 +9,6 @@ defmodule YOLO.Models.Yolox do
     frame_scaler = Keyword.fetch!(options, :frame_scaler)
     {_, _channels, height, width} = model.shapes.input
     {image_nx, image_scaling} = YOLO.FrameScalers.fit(image, {height, width}, frame_scaler)
-    # {image_nx, image_scaling} = resize_to_640x640(image, 640)
 
     image_nx =
       image_nx
@@ -32,43 +31,6 @@ defmodule YOLO.Models.Yolox do
     %{grids: grids, expanded_strides: expanded_strides}
   end
 
-  def resize_to_640x640(evision, hw \\ 640) do
-    with {:ok, image} <- Image.from_evision(evision),
-         height = Image.height(image) |> dbg(),
-         width = Image.width(image) |> dbg(),
-         scale <- compute_scale(width, height, hw, hw) |> dbg(),
-         {:ok, resized_image} <- Image.resize(image, scale),
-         canvas <- Image.new!(hw, hw, bands: 3) |> dbg do
-      img = Image.compose!(canvas, resized_image, position: :center)
-      {img, _} = Image.split_alpha(img)
-      {:ok, img} = Image.to_evision(img)
-      # Evision.imwrite("evision.png", img)
-      img = Evision.Mat.to_nx(img)
-      {img, {hw, hw, scale}}
-    end
-  end
-
-  defp compute_scale(original_width, original_height, max_width, max_height) do
-    dbg({original_width, original_height, max_width, max_height})
-    min(max_width / original_width, max_height / original_height)
-  end
-
-  def fast_nms(prob_threshold, nms_threshold) do
-    fn detected_objects ->
-      prob_threshold_filtered_objects =
-        detected_objects[[.., 4]]
-        |> Yolo.PerformantFilter.idx_filter_greater(prob_threshold)
-        |> then(&Nx.gather(detected_objects, &1 |> Nx.new_axis(1)))
-
-      Evision.DNN.nmsBoxes(
-        prob_threshold_filtered_objects[[.., 0..3]],
-        prob_threshold_filtered_objects[[.., 4]] |> Nx.to_list(),
-        prob_threshold,
-        nms_threshold
-      )
-    end
-  end
-
   @impl true
   def postprocess(%{precalculated: precalculated}, model_output, scaling_config, opts) do
     nms_fun = Keyword.get(opts, :nms_fun, fast_nms(0.4, 0.45))
@@ -78,11 +40,15 @@ defmodule YOLO.Models.Yolox do
 
     detected_objects = extract_bboxes(prediction)
 
-    idxs = nms_fun.(detected_objects)
+    case nms_fun.(detected_objects) do
+      {filtered_objects, idxs} ->
+        bboxes = Nx.take(filtered_objects, Nx.tensor(idxs)) |> Nx.to_list()
+        YOLO.FrameScalers.scale_bboxes_to_original(bboxes, scaling_config)
 
-    bboxes = Nx.take(detected_objects, Nx.tensor(idxs)) |> Nx.to_list()
-
-    YOLO.FrameScalers.scale_bboxes_to_original(bboxes, scaling_config)
+      idxs ->
+        bboxes = Nx.take(detected_objects, Nx.tensor(idxs)) |> Nx.to_list()
+        YOLO.FrameScalers.scale_bboxes_to_original(bboxes, scaling_config)
+    end
   end
 
   defn extract_bboxes(prediction) do
@@ -237,5 +203,27 @@ defmodule YOLO.Models.Yolox do
     y_grid = Nx.broadcast(y, {opts[:y_range], opts[:x_range]}) |> Nx.transpose()
 
     {x_grid, y_grid}
+  end
+
+  def fast_nms(prob_threshold, nms_threshold) do
+    fn detected_objects ->
+      prob_threshold_filtered_objects =
+        detected_objects[[.., 4]]
+        |> Yolo.PerformantFilter.idx_filter_greater(prob_threshold)
+        |> then(&Nx.gather(detected_objects, &1 |> Nx.new_axis(1)))
+      # prob_threshold_filtered_objects = detected_objects
+
+      idxs = Evision.DNN.nmsBoxes(
+        prob_threshold_filtered_objects[[.., 0..3]],
+        prob_threshold_filtered_objects[[.., 4]] |> Nx.to_list(),
+        prob_threshold,
+        nms_threshold
+      )
+
+      idxs = Nx.tensor(idxs)
+
+      Nx.take(prob_threshold_filtered_objects, idxs)
+      {prob_threshold_filtered_objects, idxs}
+    end
   end
 end

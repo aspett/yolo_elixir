@@ -121,6 +121,4 @@ defmodule YOLO.Model do
             ]
 
   @callback precalculate(model_ref :: term(), shapes :: %{(:input | :output) => tuple()}, options :: Keyword.t()) :: term()
-
-  @optional_callbacks [precalculate: 3]
 end
