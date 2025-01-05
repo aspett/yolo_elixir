@@ -25,7 +25,9 @@ defmodule YOLO.Models.Yolox do
   @impl true
   def precalculate(_model_ref, shapes, options) do
     {_, _, height, width} = shapes.input
-    {grids, expanded_strides} = generate_grids_and_expanded_strides({width, height}, options[:p6] || false)
+
+    {grids, expanded_strides} =
+      generate_grids_and_expanded_strides({width, height}, options[:p6] || false)
 
     %{grids: grids, expanded_strides: expanded_strides}
   end
@@ -51,53 +53,36 @@ defmodule YOLO.Models.Yolox do
     min(max_width / original_width, max_height / original_height)
   end
 
+  def fast_nms(prob_threshold, nms_threshold) do
+    fn detected_objects ->
+      prob_threshold_filtered_objects =
+        detected_objects[[.., 4]]
+        |> Yolo.PerformantFilter.idx_filter_greater(prob_threshold)
+        |> then(&Nx.gather(detected_objects, &1 |> Nx.new_axis(1)))
+
+      Evision.DNN.nmsBoxes(
+        prob_threshold_filtered_objects[[.., 0..3]],
+        prob_threshold_filtered_objects[[.., 4]] |> Nx.to_list(),
+        prob_threshold,
+        nms_threshold
+      )
+    end
+  end
+
   @impl true
-  def postprocess(%{precalculated: precalculated}, model_output, scaling_config, _opts) do
+  def postprocess(%{precalculated: precalculated}, model_output, scaling_config, opts) do
+    nms_fun = Keyword.get(opts, :nms_fun, fast_nms(0.4, 0.45))
+
     %{grids: grids, expanded_strides: expanded_strides} = precalculated
     prediction = process_bboxes(model_output, grids, expanded_strides)
 
-    {time, detected_objects} = :timer.tc(fn -> extract_bboxes(prediction) end)
-    dbg({:extract_bboxes, time})
+    detected_objects = extract_bboxes(prediction)
 
-    # detected_objects = Nx.greater_equal(detected_objects, Nx.tensor([0, 0, 0, 0, 0.4, 0])) |> Nx.to_list() |> dbg()
+    idxs = nms_fun.(detected_objects)
 
-    {time, idxs} = :timer.tc(fn ->
-      {ntime, _} = :timer.tc(fn ->
-      detected_objects[[..,4]]
-      |> Nx.greater(0.4)
-      |> Nx.as_type(:u8)
-      |> Nx.to_list()
-      |> Stream.with_index()
-      |> Stream.filter(fn {prob, idx} -> prob == 1 end)
-      |> Enum.to_list()
-      |> dbg()
-      end)
-      dbg({:to_list, ntime})
-      # {boxes, scores} =
-      # detected_objects[[..,4]]
-      # |> Nx.to_list()
-      # |> Stream.with_index()
-      # |> Stream.filter(fn {prob, idx} -> prob > 0.4 end)
-      # |> Enum.to_list()
-      # |> Enum.count()
-      # |> dbg()
+    bboxes = Nx.take(detected_objects, Nx.tensor(idxs)) |> Nx.to_list()
 
-    # boxes = detected_objects[[.., 0..3]]
-    # scores = detected_objects[[.., 4]] |> Nx.to_list
-      # Evision.DNN.nmsBoxes(boxes, scores, 0.4, 0.45)
-      Evision.DNN.nmsBoxes(detected_objects[[..,0..3]], detected_objects[[..,4]] |> Nx.to_list(), 0.4, 0.45)
-    end)
-    dbg({:nms, time})
-    {time, bboxes} = :timer.tc(fn ->
-      Nx.take(detected_objects, Nx.tensor(idxs)) |> Nx.to_list()
-    end)
-    dbg({:bboxes, time})
-
-    {time, result} = :timer.tc(fn ->
-      YOLO.FrameScalers.scale_bboxes_to_original(bboxes, scaling_config)
-    end)
-    dbg({:result, time})
-    result
+    YOLO.FrameScalers.scale_bboxes_to_original(bboxes, scaling_config)
   end
 
   defn extract_bboxes(prediction) do
@@ -155,8 +140,10 @@ defmodule YOLO.Models.Yolox do
     # Align shapes for broadcasting
     # Python: grids = grids.reshape(1, -1, 2)
     #         expanded_strides = expanded_strides.reshape(1, -1, 1)
-    grids = Nx.squeeze(grids, axes: [0])              # From {1, 8400, 2} to {8400, 2}
-    expanded_strides = Nx.squeeze(expanded_strides, axes: [0]) # From {1, 8400, 1} to {8400, 1}
+    # From {1, 8400, 2} to {8400, 2}
+    grids = Nx.squeeze(grids, axes: [0])
+    # From {1, 8400, 1} to {8400, 1}
+    expanded_strides = Nx.squeeze(expanded_strides, axes: [0])
 
     # Update the coordinates and sizes using tensorized operations
     # Python:
@@ -187,7 +174,7 @@ defmodule YOLO.Models.Yolox do
       |> Enum.reduce({[], []}, fn {hsize, wsize, stride}, {grids_acc, strides_acc} ->
         # Generate meshgrid for the current stride
         # Python: xv, yv = np.meshgrid(np.arange(wsize), np.arange(hsize))
-        {xv, yv} = meshgrid([x_range: wsize, y_range: hsize])
+        {xv, yv} = meshgrid(x_range: wsize, y_range: hsize)
 
         # Combine meshgrid components and reshape to match YOLOX output structure
         # Python: grid = np.stack((xv, yv), 2).reshape(1, -1, 2)
@@ -201,7 +188,6 @@ defmodule YOLO.Models.Yolox do
         # {Nx.concatenate([grids_acc, grid], axis: 1), Nx.concatenate([strides_acc, expanded_stride], axis: 1)}
         {grids_acc ++ [grid], strides_acc ++ [expanded_stride]}
       end)
-
 
     # Concatenate grids and expanded strides for all feature map levels
     # Python: grids = np.concatenate(grids, 1)
@@ -220,8 +206,10 @@ defmodule YOLO.Models.Yolox do
     # Align shapes for broadcasting
     # Python: grids = grids.reshape(1, -1, 2)
     #         expanded_strides = expanded_strides.reshape(1, -1, 1)
-    grids = Nx.squeeze(grids, axes: [0])              # From {1, 8400, 2} to {8400, 2}
-    expanded_strides = Nx.squeeze(expanded_strides, axes: [0]) # From {1, 8400, 1} to {8400, 1}
+    # From {1, 8400, 2} to {8400, 2}
+    grids = Nx.squeeze(grids, axes: [0])
+    # From {1, 8400, 1} to {8400, 1}
+    expanded_strides = Nx.squeeze(expanded_strides, axes: [0])
 
     # Update the coordinates and sizes using tensorized operations
     # Python:
@@ -243,8 +231,10 @@ defmodule YOLO.Models.Yolox do
     y = Nx.iota({opts[:y_range]})
 
     # Broadcast x and y to create the grids
-    x_grid = Nx.broadcast(x, {opts[:y_range], opts[:x_range]})  # Repeat x across rows
-    y_grid = Nx.broadcast(y, {opts[:y_range], opts[:x_range]}) |> Nx.transpose()  # Repeat y across columns
+    # Repeat x across rows
+    x_grid = Nx.broadcast(x, {opts[:y_range], opts[:x_range]})
+    # Repeat y across columns
+    y_grid = Nx.broadcast(y, {opts[:y_range], opts[:x_range]}) |> Nx.transpose()
 
     {x_grid, y_grid}
   end
