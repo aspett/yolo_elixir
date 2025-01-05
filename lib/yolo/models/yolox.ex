@@ -44,12 +44,18 @@ defmodule YOLO.Models.Yolox do
     detected_objects = extract_bboxes(prediction)
 
     case nms_fun.(detected_objects) do
+      {_filtered_objects, []} ->
+        []
+
       {filtered_objects, idxs} ->
         bboxes = Nx.take(filtered_objects, Nx.tensor(idxs)) |> Nx.to_list()
         YOLO.FrameScalers.scale_bboxes_to_original(bboxes, scaling_config)
 
       [[_|_]|_] = bboxes ->
         YOLO.FrameScalers.scale_bboxes_to_original(bboxes, scaling_config)
+
+      [] ->
+        []
 
       idxs ->
         dbg(idxs)
