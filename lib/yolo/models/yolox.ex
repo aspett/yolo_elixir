@@ -39,7 +39,7 @@ defmodule YOLO.Models.Yolox do
     nms_fun = Keyword.get(opts, :nms_fun, slow_nms(prob_threshold, nms_threshold))
 
     %{grids: grids, expanded_strides: expanded_strides} = precalculated
-    prediction = process_bboxes(model_output, grids, expanded_strides)
+    prediction = process_bboxes(model_output, grids, expanded_strides) |> dbg()
 
     detected_objects = extract_bboxes(prediction)
 
@@ -163,21 +163,16 @@ defmodule YOLO.Models.Yolox do
     {grids, expanded_strides}
   end
 
-  # Basic implementation of numpy.meshgrid
+  # Poor man's ripoff of numpy.meshgrid for my purposes
   defn meshgrid(opts \\ []) do
     opts = keyword!(opts, x_range: 1, y_range: 1)
-    # Generate 1D tensors for x and y ranges
-    x = Nx.iota({opts[:x_range]})
-    y = Nx.iota({opts[:y_range]})
-
-    # Broadcast x and y to create the grids
-    # Repeat x across rows
+    # Increase across rows
     # [[0, 1, 2, ...], [0, 1, 2, ...], ...]
-    x_grid = Nx.broadcast(x, {opts[:y_range], opts[:x_range]})
+    x_grid = Nx.iota({opts[:x_range], opts[:x_range]}, axis: 1)
 
-    # Repeat y across columns
+    # Increase across columns
     # [[0, 0, 0, ...], [1, 1, 1, ...], ...]
-    y_grid = Nx.broadcast(y, {opts[:y_range], opts[:x_range]}) |> Nx.transpose()
+    y_grid = Nx.iota({opts[:y_range], opts[:y_range]}, axis: 0)
 
     {x_grid, y_grid}
   end
