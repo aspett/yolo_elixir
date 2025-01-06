@@ -1,4 +1,11 @@
 defmodule YOLO.Models.Yolox do
+  @moduledoc """
+  YOLOX model implementation for preprocessing input images
+  and postprocessing detections using non-maximum suppression (NMS).
+
+  Supports YOLOX models found at [https://github.com/Megvii-BaseDetection/YOLOX](github.com/Megvii-BaseDetection/YOLOX)
+  """
+
   @behaviour YOLO.Model
 
   import Nx.Defn
@@ -41,48 +48,8 @@ defmodule YOLO.Models.Yolox do
 
     model_output
     |> process_bboxes(grids, expanded_strides)
-    |> extract_bboxes()
     |> nms_fun.(prob_threshold, iou_threshold)
     |> YOLO.FrameScalers.scale_bboxes_to_original(scaling_config)
-
-    # case nms_fun.(detected_objects) do
-    #   {_filtered_objects, []} ->
-    #     []
-
-    #   [] ->
-    #     []
-
-    #   {filtered_objects, idxs} ->
-    #     bboxes = Nx.take(filtered_objects, Nx.tensor(idxs)) |> Nx.to_list()
-    #     YOLO.FrameScalers.scale_bboxes_to_original(bboxes, scaling_config)
-
-    #   [[_|_]|_] = bboxes ->
-    #     YOLO.FrameScalers.scale_bboxes_to_original(bboxes, scaling_config)
-
-    #   idxs ->
-    #     bboxes = Nx.take(detected_objects, Nx.tensor(idxs)) |> Nx.to_list()
-    #     YOLO.FrameScalers.scale_bboxes_to_original(bboxes, scaling_config)
-    # end
-  end
-
-  defn extract_bboxes(prediction) do
-    # {n, 4}
-    bboxes = Nx.slice_along_axis(prediction, 0, 4, axis: 1)
-
-    # {n, 1}
-    objectness = Nx.slice_along_axis(prediction, 4, 1, axis: 1)
-
-    # {n, 80}
-    class_probs = Nx.slice_along_axis(prediction, 5, 80, axis: 1)
-
-    # Yolox calculates detection scores as the product of maximum class probabilities and objectness score
-    scores = Nx.multiply(class_probs, objectness)
-
-    # Per row, gets the max prob and the class with that prob
-    {max_prob, max_prob_class} = Nx.top_k(scores, k: 1)
-
-    # concatenating the columns [cx, cy, w, h, prob, class]
-    Nx.concatenate([bboxes, max_prob, max_prob_class], axis: 1)
   end
 
   # YOLOX uses convolutions, so to decode the output, we have to
@@ -121,6 +88,49 @@ defmodule YOLO.Models.Yolox do
     # Concatenate updated slices with the remainder of the outputs
     # Python: return outputs
     Nx.concatenate([updated_coords, updated_sizes, remainder], axis: 1)
+  end
+
+  @doc """
+  Calculates the detection score for each prediction as the product of the maximum class
+  probability and the objectness score.
+
+  Adaptation of YOLO.NMS.filter_predictions/2, but calculates the correct score based on
+  the product of the maximum class probability and the objectness score which differs from Ultralytics
+
+  Removes prob_threshold filtering so that we can use Nx.Defn compilation for performance.
+  """
+  defn calculate_max_prob_score_per_prediction(predictions) do
+    # {n, 4}
+    bboxes = Nx.slice_along_axis(predictions, 0, 4, axis: 1)
+
+    # {n, 1}
+    objectness = Nx.slice_along_axis(predictions, 4, 1, axis: 1)
+
+    # {n, 80}
+    class_probs = Nx.slice_along_axis(predictions, 5, 80, axis: 1)
+
+    # Yolox calculates detection scores as the product of maximum class probabilities and objectness score
+    scores = Nx.multiply(class_probs, objectness)
+
+    # Per row, gets the max prob and the class with that prob
+    {max_prob, max_prob_class} = Nx.top_k(scores, k: 1)
+
+    # concatenating the columns [cx, cy, w, h, prob, class]
+    Nx.concatenate([bboxes, max_prob, max_prob_class], axis: 1)
+  end
+
+  # Basic ripoff of numpy.meshgrid for yolox purposes
+  defnp meshgrid(opts \\ []) do
+    opts = keyword!(opts, x_range: 1, y_range: 1)
+    # Increase across rows
+    # [[0, 1, 2, ...], [0, 1, 2, ...], ...]
+    x_grid = Nx.iota({opts[:x_range], opts[:x_range]}, axis: 1)
+
+    # Increase across columns
+    # [[0, 0, 0, ...], [1, 1, 1, ...], ...]
+    y_grid = Nx.iota({opts[:y_range], opts[:y_range]}, axis: 0)
+
+    {x_grid, y_grid}
   end
 
   def generate_grids_and_expanded_strides({width, height}, p6 \\ false) do
@@ -164,105 +174,11 @@ defmodule YOLO.Models.Yolox do
     {grids, expanded_strides}
   end
 
-  # Poor man's ripoff of numpy.meshgrid for my purposes
-  defn meshgrid(opts \\ []) do
-    opts = keyword!(opts, x_range: 1, y_range: 1)
-    # Increase across rows
-    # [[0, 1, 2, ...], [0, 1, 2, ...], ...]
-    x_grid = Nx.iota({opts[:x_range], opts[:x_range]}, axis: 1)
-
-    # Increase across columns
-    # [[0, 0, 0, ...], [1, 1, 1, ...], ...]
-    y_grid = Nx.iota({opts[:y_range], opts[:y_range]}, axis: 0)
-
-    {x_grid, y_grid}
-  end
-
   def default_nms(model_output_nx, prob_threshold, nms_threshold) do
     model_output_nx
+    |> calculate_max_prob_score_per_prediction()
     |> Nx.to_list()
     |> Stream.filter(fn [_cx, _cy, _w, _h, prob, _class] -> prob >= prob_threshold end)
-    |> Enum.sort_by(fn [_cx, _cy, _w, _h, prob, _class] -> prob end, :desc)
     |> YOLO.NMS.nms(nms_threshold)
-  end
-
-  def alt_nms(model_output_nx, prob_threshold, nms_threshold) do
-    output_idxs = Yolo.PerformantFilter.idx_filter_greater(model_output_nx[[.., 4]], prob_threshold)
-    filtered_objects = Nx.gather(model_output_nx, output_idxs |> Nx.new_axis(1))
-
-    filtered_objects
-    |> Nx.to_list()
-    |> Enum.sort_by(fn [_cx, _cy, _w, _h, prob, _class] -> prob end, :desc)
-    |> YOLO.NMS.nms(nms_threshold)
-  end
-
-  def x_fast_nms(model_output_nx, prob_threshold, nms_threshold) do
-    output_idxs = Yolo.PerformantFilter.idx_filter_greater(model_output_nx[[.., 4]], prob_threshold)
-    filtered_objects = Nx.gather(model_output_nx, output_idxs |> Nx.new_axis(1))
-
-    result_idxs = Evision.DNN.nmsBoxes(
-      filtered_objects[[.., 0..3]],
-      filtered_objects[[.., 4]] |> Nx.to_list(),
-      prob_threshold,
-      nms_threshold
-    )
-
-    filtered_objects
-    |> Nx.gather(result_idxs |> Nx.tensor() |> Nx.new_axis(1))
-    |> Nx.to_list()
-  end
-
-  def slow_nms(prob_threshold, nms_threshold) do
-    fn detected_objects ->
-      filtered_objects =
-        detected_objects
-        |> Nx.to_list()
-        |> Enum.sort_by(fn [_cx, _cy, _w, _h, prob, _class] -> prob end, :desc)
-        |> Enum.filter(fn [_cx, _cy, _w, _h, prob, _class] ->
-          prob >= prob_threshold
-        end)
-
-      YOLO.NMS.nms(filtered_objects, nms_threshold)
-    end
-  end
-
-  def fast_nms(prob_threshold, nms_threshold) do
-    fn detected_objects ->
-      # Use rust to filter for objects with a prob threshold above the threshold
-      # to reduce number of objects going through evision nms
-      idxs = Yolo.PerformantFilter.idx_filter_greater(detected_objects[[.., 4]], prob_threshold)
-
-      case idxs do
-        [] ->
-          []
-
-        idxs ->
-          prob_threshold_filtered_objects = Nx.gather(detected_objects, idxs |> Nx.new_axis(1))
-          idxs = Evision.DNN.nmsBoxes(
-            prob_threshold_filtered_objects[[.., 0..3]],
-            prob_threshold_filtered_objects[[.., 4]] |> Nx.to_list(),
-            prob_threshold,
-            nms_threshold
-          )
-
-          idxs = Nx.tensor(idxs)
-          {prob_threshold_filtered_objects, idxs}
-      end
-
-      # prob_threshold_filtered_objects = detected_objects
-
-      # Evision provides a good nms implementation that's compatible, so we use it
-      # idxs = Evision.DNN.nmsBoxes(
-      #   prob_threshold_filtered_objects[[.., 0..3]],
-      #   prob_threshold_filtered_objects[[.., 4]] |> Nx.to_list(),
-      #   prob_threshold,
-      #   nms_threshold
-      # )
-
-      # idxs = Nx.tensor(idxs)
-
-      # Return the filtered objects and the indices of the objects that were kept
-      # {prob_threshold_filtered_objects, idxs}
-    end
   end
 end
