@@ -5,7 +5,7 @@ defmodule YOLO.Models.Yolox do
 
   @impl true
   @spec preprocess(YOLO.Model.t(), term(), Keyword.t()) :: {Nx.Tensor.t(), ScalingConfig}
-  def preprocess(model, %Evision.Mat{} = image, options) do
+  def preprocess(model, image, options) do
     frame_scaler = Keyword.fetch!(options, :frame_scaler)
     {_, _channels, height, width} = model.shapes.input
     {image_nx, image_scaling} = YOLO.FrameScalers.fit(image, {height, width}, frame_scaler)
@@ -33,35 +33,36 @@ defmodule YOLO.Models.Yolox do
 
   @impl true
   def postprocess(%{precalculated: precalculated}, model_output, scaling_config, opts) do
-    prob_threshold = Keyword.get(opts, :prob_threshold, 0.4)
-    nms_threshold = Keyword.get(opts, :nms_threshold, 0.45)
-
-    nms_fun = Keyword.get(opts, :nms_fun, slow_nms(prob_threshold, nms_threshold))
+    prob_threshold = Keyword.fetch!(opts, :prob_threshold)
+    iou_threshold = Keyword.fetch!(opts, :iou_threshold)
+    nms_fun = Keyword.get(opts, :nms_fun, &default_nms/3)
 
     %{grids: grids, expanded_strides: expanded_strides} = precalculated
-    prediction = process_bboxes(model_output, grids, expanded_strides) |> dbg()
 
-    detected_objects = extract_bboxes(prediction)
+    model_output
+    |> process_bboxes(grids, expanded_strides)
+    |> extract_bboxes()
+    |> nms_fun.(prob_threshold, iou_threshold)
+    |> YOLO.FrameScalers.scale_bboxes_to_original(scaling_config)
 
-    case nms_fun.(detected_objects) do
-      {_filtered_objects, []} ->
-        []
+    # case nms_fun.(detected_objects) do
+    #   {_filtered_objects, []} ->
+    #     []
 
-      [] ->
-        []
+    #   [] ->
+    #     []
 
-      {filtered_objects, idxs} ->
-        bboxes = Nx.take(filtered_objects, Nx.tensor(idxs)) |> Nx.to_list()
-        YOLO.FrameScalers.scale_bboxes_to_original(bboxes, scaling_config)
+    #   {filtered_objects, idxs} ->
+    #     bboxes = Nx.take(filtered_objects, Nx.tensor(idxs)) |> Nx.to_list()
+    #     YOLO.FrameScalers.scale_bboxes_to_original(bboxes, scaling_config)
 
-      [[_|_]|_] = bboxes ->
-        YOLO.FrameScalers.scale_bboxes_to_original(bboxes, scaling_config)
+    #   [[_|_]|_] = bboxes ->
+    #     YOLO.FrameScalers.scale_bboxes_to_original(bboxes, scaling_config)
 
-      idxs ->
-        dbg(idxs)
-        bboxes = Nx.take(detected_objects, Nx.tensor(idxs)) |> Nx.to_list()
-        YOLO.FrameScalers.scale_bboxes_to_original(bboxes, scaling_config)
-    end
+    #   idxs ->
+    #     bboxes = Nx.take(detected_objects, Nx.tensor(idxs)) |> Nx.to_list()
+    #     YOLO.FrameScalers.scale_bboxes_to_original(bboxes, scaling_config)
+    # end
   end
 
   defn extract_bboxes(prediction) do
@@ -175,6 +176,40 @@ defmodule YOLO.Models.Yolox do
     y_grid = Nx.iota({opts[:y_range], opts[:y_range]}, axis: 0)
 
     {x_grid, y_grid}
+  end
+
+  def default_nms(model_output_nx, prob_threshold, nms_threshold) do
+    model_output_nx
+    |> Nx.to_list()
+    |> Stream.filter(fn [_cx, _cy, _w, _h, prob, _class] -> prob >= prob_threshold end)
+    |> Enum.sort_by(fn [_cx, _cy, _w, _h, prob, _class] -> prob end, :desc)
+    |> YOLO.NMS.nms(nms_threshold)
+  end
+
+  def alt_nms(model_output_nx, prob_threshold, nms_threshold) do
+    output_idxs = Yolo.PerformantFilter.idx_filter_greater(model_output_nx[[.., 4]], prob_threshold)
+    filtered_objects = Nx.gather(model_output_nx, output_idxs |> Nx.new_axis(1))
+
+    filtered_objects
+    |> Nx.to_list()
+    |> Enum.sort_by(fn [_cx, _cy, _w, _h, prob, _class] -> prob end, :desc)
+    |> YOLO.NMS.nms(nms_threshold)
+  end
+
+  def x_fast_nms(model_output_nx, prob_threshold, nms_threshold) do
+    output_idxs = Yolo.PerformantFilter.idx_filter_greater(model_output_nx[[.., 4]], prob_threshold)
+    filtered_objects = Nx.gather(model_output_nx, output_idxs |> Nx.new_axis(1))
+
+    result_idxs = Evision.DNN.nmsBoxes(
+      filtered_objects[[.., 0..3]],
+      filtered_objects[[.., 4]] |> Nx.to_list(),
+      prob_threshold,
+      nms_threshold
+    )
+
+    filtered_objects
+    |> Nx.gather(result_idxs |> Nx.tensor() |> Nx.new_axis(1))
+    |> Nx.to_list()
   end
 
   def slow_nms(prob_threshold, nms_threshold) do
