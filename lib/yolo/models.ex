@@ -133,13 +133,8 @@ defmodule YOLO.Models do
     opts = Keyword.merge(@default_detect_options, opts)
 
     {input_nx, scaling_config} = model_impl.preprocess(model, image, opts)
-    {time, output_nx} = :timer.tc(fn -> run(model, input_nx) end)
-    dbg({:inference, time})
-    {time, result} = :timer.tc(fn ->
-      model_impl.postprocess(model, output_nx, scaling_config, opts)
-    end)
-    dbg({:postprocess, time})
-    result
+    output_nx = run(model, input_nx)
+    model_impl.postprocess(model, output_nx, scaling_config, opts)
   end
 
   @doc """
