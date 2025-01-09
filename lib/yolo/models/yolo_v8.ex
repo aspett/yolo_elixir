@@ -13,4 +13,7 @@ defmodule YOLO.Models.YoloV8 do
 
   @deprecated "Use YOLO.Models.Ultralytics.precalculate/3 instead"
   defdelegate precalculate(model_ref, shapes, options), to: Ultralytics
+
+  @deprecated "Use YOLO.Models.Ultralytics.reshape_output/1 instead"
+  defdelegate reshape_output(output_nx), to: Ultralytics
 end
