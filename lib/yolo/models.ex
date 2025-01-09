@@ -95,11 +95,16 @@ defmodule YOLO.Models do
 
   @spec model_shapes(Ortex.Model.t()) :: %{(:input | :output) => tuple()}
   defp model_shapes(ref) do
-    {[{_, _, input_shape}], [{_, _, output_shape}]} =
+    {[{_, _, input_shape}], outputs} =
       Ortex.Native.show_session(ref.reference)
 
-    %{input: List.to_tuple(input_shape), output: List.to_tuple(output_shape)}
+    outputs = Enum.map(outputs, fn {_name, _str, shape} -> List.to_tuple(shape) end)
+
+    %{input: List.to_tuple(input_shape), output: unwrap_list(outputs)}
   end
+
+  defp unwrap_list([el]), do: el
+  defp unwrap_list(list), do: list
 
   @doc """
   Performs object detection on an image using a loaded YOLO model.
@@ -153,7 +158,9 @@ defmodule YOLO.Models do
   """
   @spec run(YOLO.Model.t(), Nx.Tensor.t()) :: Nx.Tensor.t()
   def run(model, image_tensor) do
-    {output} = Ortex.run(model.ref, image_tensor)
-    Nx.backend_transfer(output)
+    model.ref
+    |> Ortex.run(image_tensor)
+    |> Nx.backend_transfer()
+    |> model.model_impl.reshape_output()
   end
 end

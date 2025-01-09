@@ -121,4 +121,6 @@ defmodule YOLO.Model do
             ]
 
   @callback precalculate(model_ref :: term(), shapes :: %{(:input | :output) => tuple()}, options :: Keyword.t()) :: term()
+
+  @callback reshape_output(output :: Nx.Tensor.t()) :: Nx.Tensor.t()
 end

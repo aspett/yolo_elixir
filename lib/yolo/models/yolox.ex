@@ -206,4 +206,7 @@ defmodule YOLO.Models.Yolox do
     |> Enum.sort_by(fn [_cx, _cy, _w, _h, prob, _class] -> prob end, :desc)
     |> YOLO.NMS.nms(nms_threshold)
   end
+
+  @impl true
+  def reshape_output({output_nx}), do: {output_nx}
 end
